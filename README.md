@@ -11,7 +11,7 @@
 | 依赖先后 | `下游开始 ≥ 上游部署结束 + gap_minutes` |
 | 团队禁发 | 仅**部署区间**不得与所属团队禁发时段重叠（回滚允许进入禁发期） |
 | 维护冻结 | **占用区间（部署+回滚）**不得与任何冻结重叠 |
-| 共享资源 | 同名资源同一时间只能被一个服务占用（含回滚窗口） |
+| 共享资源 | 同名资源同一时间被占用的名额不得超过其容量：未在 `resource_capacities` 中声明的资源容量为 **1**（同一时间只能被一个服务占用）；声明正整数容量 `c` 时最多 `c` 个服务并行，第 `c+1` 个必须错峰。每个服务在 `resources` 中每列出一次资源即占 **1** 个名额，占用区间含部署与回滚窗口，直到回滚占用结束才释放 |
 | 夏令时 | 不带偏移量的本地墙上时间若在 DST 切换时**重复**（回拨）或**不存在**（前拨），请求被拒绝（422），并给出 gap 两侧 / 重复两次的绝对时间供修正；带偏移量的绝对时间（如 `...+01:00`、`...Z`）无歧义，直接通过 |
 | 无解 | 求解器返回一个足以导致矛盾的约束子集（sufficient assumption core），即“阻塞组合”，放松其中任意一项后可重新求解；**不返回部分排程** |
 
@@ -80,9 +80,23 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
   "freezes": [
     {"label": "周末封网", "start": "2026-11-14T02:00", "end": "2026-11-14T03:00", "timezone": "UTC"}
   ],
+  "resource_capacities": {
+    "payment-db": 2,
+    "k8s-prod-east": 1
+  },
   "max_solve_seconds": 10
 }
 ```
+
+`resource_capacities` 为**可选**字段，语义：
+
+- 键是资源名（需与服务 `resources` 中的名字一致），值为该资源的**并行容量，必须是正整数**；
+- 未声明的资源按容量 `1` 处理——与旧版行为完全一致，省略该字段时两个接口的行为不变；
+- 服务的 `resources` 每列出一个资源即占用 `1` 个名额，从部署开始持续到**回滚占用结束**释放；
+  例如容量为 `2` 时两项可并行，第三项必须错峰到前两项有人释放名额之后；
+- 容量非正、非整数（如 `0`、`-1`、`1.5`、`"2"`），或同一服务在 `resources` 中重复列出同一资源，
+  都会按下文的 **422 `errors` 结构**拒绝；
+- 仅声明容量但没有任何服务使用该资源是合法的（不影响求解）。
 
 时间串支持两种写法：
 
@@ -127,7 +141,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 }
 ```
 
-**输入错误（422）**：DST 重复/不存在、未知时区、依赖环、区间非法、引用不存在的服务、候选窗短于部署+回滚占用等：
+**输入错误（422）**：DST 重复/不存在、未知时区、依赖环、区间非法、引用不存在的服务、候选窗短于部署+回滚占用、`resource_capacities` 值非正整数、同一服务重复列出资源等：
 
 ```json
 {
@@ -147,6 +161,58 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 `dst_ambiguous`（重复时间）的建议分别给出回拨前后的两个绝对时刻（第一次/第二次）。
 这些值可直接粘贴回输入框重新提交。
+
+#### 共享资源并行容量调用示例（curl）
+
+三个服务都要占用同一个 `db-conn`，各需部署 60 分钟、回滚 30 分钟，声明容量为 `2`：
+前两项在 00:00 并行，第三项错峰到 01:30（前两项回滚占用结束的时刻）。
+
+```bash
+curl -X POST http://localhost:8000/api/schedule \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "services": [
+      {"id": "a", "name": "服务 A", "timezone": "UTC",
+       "duration_minutes": 60, "rollback_minutes": 30, "resources": ["db-conn"],
+       "windows": [{"start": "2026-12-01T00:00:00Z", "end": "2026-12-01T04:00:00Z", "timezone": "UTC"}]},
+      {"id": "b", "name": "服务 B", "timezone": "UTC",
+       "duration_minutes": 60, "rollback_minutes": 30, "resources": ["db-conn"],
+       "windows": [{"start": "2026-12-01T00:00:00Z", "end": "2026-12-01T04:00:00Z", "timezone": "UTC"}]},
+      {"id": "c", "name": "服务 C", "timezone": "UTC",
+       "duration_minutes": 60, "rollback_minutes": 30, "resources": ["db-conn"],
+       "windows": [{"start": "2026-12-01T00:00:00Z", "end": "2026-12-01T04:00:00Z", "timezone": "UTC"}]}
+    ],
+    "resource_capacities": {"db-conn": 2}
+  }'
+```
+
+返回（200，节选）：
+
+```json
+{
+  "feasible": true,
+  "status": "optimal",
+  "schedule": [
+    {"service_id": "b", "deploy_start_utc": "2026-12-01T00:00:00+00:00", "occupied_until_utc": "2026-12-01T01:30:00+00:00"},
+    {"service_id": "c", "deploy_start_utc": "2026-12-01T00:00:00+00:00", "occupied_until_utc": "2026-12-01T01:30:00+00:00"},
+    {"service_id": "a", "deploy_start_utc": "2026-12-01T01:30:00+00:00", "occupied_until_utc": "2026-12-01T03:00:00+00:00"}
+  ]
+}
+```
+
+容量不足导致排不开时，**不返回部分排程**，阻塞组合中会包含该资源约束（与其它约束一起），例如
+`{"code": "resource:db-conn", "message": "共享资源 db-conn 并行容量为 2：最多 2 个服务同时占用，第 3 个必须错峰…"}`。
+容量给成 `0`、`-1`、`1.5` 等非法值时返回 **422**，沿用统一的 `errors` 结构：
+
+```json
+{
+  "errors": [
+    {"code": "bad_resource_capacity", "field": "resource_capacities[db-conn]",
+     "message": "资源 'db-conn' 的容量必须为正整数，得到 0（容量 <= 0 无法占用）",
+     "suggestions": null}
+  ]
+}
+```
 
 ### `POST /api/schedule/diff` — 变更影响预演
 
@@ -168,9 +234,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
   给出变化前后的 UTC 时刻与变化分钟数（`delta_minutes` 正为推迟、负为提前；未变化的字段为 `null`）；
 - `added` / `removed`：仅在 `modified` 中出现（新增）/ 仅在 `current` 中出现（被移除）的服务；
 - 两份请求结果完全一致时，三个列表均为空（空差异）。
+- 两侧按**各自请求中的 `resource_capacities` 独立求解**（例如一侧容量 1、另一侧容量 2）；
 - **任一请求输入错误或无解时，不输出差异结果**：在 `failures` 中按 `current` / `modified`
-  分别给出该侧的完整输入错误（HTTP 422）或阻塞约束组合（HTTP 200、`feasible=false`），
-  与直接调用 `/api/schedule` 得到的内容一致。
+  分别给出该侧的完整输入错误（HTTP 422）或阻塞约束组合（HTTP 200、`feasible=false`，
+  容量导致的无解其阻塞组合中会含 `resource:<资源名>` 约束），
+  与直接调用 `/api/schedule` 得到的内容一致；任一侧失败时 `diff` 均为 `null`。
 
 调用示例：
 
@@ -273,6 +341,20 @@ curl -X POST http://localhost:8000/api/schedule/diff \
 ```
 
 两侧同时失败时 `failures` 中会同时包含 `current` 与 `modified` 两个键。
+
+容量调整的预演同理：`current` 省略容量（容量 1，三个服务串行排不下 →
+`feasible=false`、`failures.current.blockers` 含 `resource:db-conn`），
+`modified` 声明 `"resource_capacities": {"db-conn": 2}` 后可行——此时
+`diff` 为 `null`、`failures` 只含 `current` 键（HTTP 200）；只有两侧都可行时才输出时刻差异。
+
+```bash
+curl -X POST http://localhost:8000/api/schedule/diff \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "current":  { "services": [ ...三项共用 db-conn 的完整请求... ] },
+    "modified": { "services": [ ...同一份请求... ], "resource_capacities": {"db-conn": 2} }
+  }'
+```
 
 ## 项目结构
 

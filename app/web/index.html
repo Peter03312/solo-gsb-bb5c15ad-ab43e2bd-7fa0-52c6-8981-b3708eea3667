@@ -58,6 +58,7 @@
     <h2>请求（JSON）</h2>
     <div class="btns">
       <button onclick="loadScenario('basic')">示例：跨时区可行排程</button>
+      <button class="secondary" onclick="loadScenario('capacity')">资源并行容量示例</button>
       <button class="secondary" onclick="loadScenario('dst')">DST 校验示例</button>
       <button class="secondary" onclick="loadScenario('infeasible')">不可行示例</button>
     </div>
@@ -109,6 +110,26 @@ const SCENARIOS = {
     freezes: [
       {label:"周末封网", start:"2026-11-14T02:00", end:"2026-11-14T03:00", timezone:"UTC"}
     ]
+  },
+  capacity: {
+    // 四个服务共用同一发布集群；容量声明为 2：任意时刻最多两项并行（占用含回滚窗口），
+    // 结果为 00:00 两项并行、02:00 再两项；删掉 resource_capacities（容量回到 1）则会串行错峰。
+    services: [
+      { id:"svc-a", name:"微服务 A", timezone:"UTC",
+        duration_minutes:60, rollback_minutes:60, resources:["release-cluster"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T06:00", timezone:"UTC"}]},
+      { id:"svc-b", name:"微服务 B", timezone:"UTC",
+        duration_minutes:60, rollback_minutes:60, resources:["release-cluster"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T06:00", timezone:"UTC"}]},
+      { id:"svc-c", name:"微服务 C", timezone:"UTC",
+        duration_minutes:60, rollback_minutes:60, resources:["release-cluster"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T06:00", timezone:"UTC"}]},
+      { id:"svc-d", name:"微服务 D", timezone:"UTC",
+        duration_minutes:60, rollback_minutes:60, resources:["release-cluster"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T06:00", timezone:"UTC"}]}
+    ],
+    dependencies: [], service_teams: [], team_blackouts: [], freezes: [],
+    resource_capacities: {"release-cluster": 2}
   },
   dst: {
     services: [

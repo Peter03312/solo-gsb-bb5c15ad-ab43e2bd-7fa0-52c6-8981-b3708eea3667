@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -52,6 +54,11 @@ class ScheduleRequest(BaseModel):
     service_teams: list[ServiceTeamIn] = Field(default_factory=list)
     team_blackouts: list[BlackoutIn] = Field(default_factory=list)
     freezes: list[FreezeIn] = Field(default_factory=list)
+    resource_capacities: Any = Field(
+        default_factory=dict,
+        description="共享资源并行容量：资源名 -> 正整数的对象；未声明的资源按容量 1 处理。"
+                    "非正整数或同一服务重复列出资源会以 422 errors 返回。",
+    )
     max_solve_seconds: float = Field(10.0, gt=0, le=60)
 
 

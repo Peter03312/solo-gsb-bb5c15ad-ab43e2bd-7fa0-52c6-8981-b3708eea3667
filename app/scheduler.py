@@ -7,7 +7,8 @@
   NoOverlap（占用区间 vs 缺口）。
 - 维护冻结：占用区间不得与任何冻结区间相交（部署与回滚窗口都要避开）。
 - 团队禁发：仅部署区间不得与所属团队禁发时段相交（回滚允许进入禁发期）。
-- 共享资源：同一资源上的所有服务占用区间两两不重叠。
+- 共享资源：同一资源上任意时刻的占用数不得超过其容量（默认 1，即区间两两不重叠；
+  resource_capacities 声明正整数容量 c 时最多 c 项并行，其余错峰）。
 - 依赖：downstream.start >= upstream.start + deploy_up + gap。
 
 CP-SAT 的 NoOverlap 不接受约束级 enforcement literal，因此采用“可选镜像区间”：
@@ -146,22 +147,38 @@ def solve(norm: Normalized) -> SolveResult:
                     opt_constant(p.start, p.end - p.start, lit, f"bo_p_{sid}_{p.start}"),
                 ])
 
-    # ---- 共享资源占用：同资源的占用区间互不重叠（每个资源一条假设） ----
+    # ---- 共享资源占用：同资源上任意时刻占用数不得超过容量（默认 1） ----
+    # 容量 1：占用区间两两不重叠（NoOverlap，两项可串行）；
+    # 容量 c>=2：Cumulative，每个服务占 1 个名额，最多 c 项并行（含回滚窗口）。
     resource_users: dict[str, list[str]] = {}
     for sid, s in services.items():
         for r in s.resources:
             resource_users.setdefault(r, []).append(sid)
     for resource, users in resource_users.items():
-        if len(users) < 2:
+        capacity = norm.resource_capacities.get(resource, 1)
+        if len(users) <= capacity:
+            # 占用者数量本身就不超过容量，该资源不可能构成任何冲突。
             continue
+        if capacity == 1:
+            cap_desc = "同时只能被一个服务占用"
+        else:
+            cap_desc = (f"并行容量为 {capacity}：最多 {capacity} 个服务同时占用，"
+                        f"第 {capacity + 1} 个必须错峰")
         lit = new_assumption(
             f"resource:{resource}",
-            f"共享资源 {resource} 同时只能被一个服务占用（部署+回滚窗口）；"
+            f"共享资源 {resource} {cap_desc}（占用含部署+回滚窗口）；"
             f"涉及: {', '.join(services[u].name for u in users)}",
         )
-        m.add_no_overlap([
-            opt_mirror(occupy_iv[u], lit, f"res_{resource}_{u}") for u in users
-        ])
+        mirrors = [opt_mirror(occupy_iv[u], lit, f"res_{resource}_{u}") for u in users]
+        if capacity == 1:
+            m.add_no_overlap(mirrors)
+        else:
+            # 可选区间在场（lit=真）时占用 1 个名额；缺席时需求为 0。
+            m.add_cumulative(
+                mirrors,
+                [1] * len(users),
+                capacity,
+            )
 
     # ---- 依赖先后 + 最小间隔（线性不等式支持直接挂 literal） ----
     for d in norm.dependencies:

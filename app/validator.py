@@ -56,6 +56,7 @@ class Normalized:
     team_members: dict[str, list[str]]  # service_id -> teams
     blackouts: dict[str, list[Period]]  # team -> periods
     freezes: list[Period]
+    resource_capacities: dict[str, int]  # 资源名 -> 并行容量；未列出的资源按 1
     max_solve_seconds: float
 
 
@@ -142,6 +143,16 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
                         f" 部署+回滚占用 {win_span}s，单独使用该窗必然不可行"
                     ),
                 })
+        # 同一服务重复列出资源：每个重复项占用多少名额有歧义，直接拒绝。
+        seen_resources: set[str] = set()
+        for j, r in enumerate(s.resources):
+            if r in seen_resources:
+                errors.append({
+                    "code": "duplicate_resource",
+                    "field": f"services[{s.id}].resources[{j}]",
+                    "message": f"服务 {s.id} 的资源列表中资源 {r!r} 重复出现，每个资源每个服务只能列出一次",
+                })
+            seen_resources.add(r)
         services[s.id] = Service(
             id=s.id,
             name=s.name or s.id,
@@ -197,6 +208,25 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
         if parsed:
             freezes.append(Period(parsed[0], parsed[1], f"维护冻结：{f.label}"))
 
+    # 6) 共享资源并行容量：只接受正整数；未声明的资源默认容量 1。
+    resource_capacities: dict[str, int] = {}
+    raw_capacities = req.resource_capacities
+    if not isinstance(raw_capacities, dict):
+        errors.append({"code": "bad_resource_capacities", "field": "resource_capacities",
+                       "message": "resource_capacities 必须是资源名到容量整数的对象（如 {\"shared-db\": 2}）"})
+    else:
+        for r, cap in raw_capacities.items():
+            field = f"resource_capacities[{r}]"
+            if isinstance(cap, bool) or not isinstance(cap, int):
+                errors.append({"code": "bad_resource_capacity", "field": field,
+                               "message": f"资源 {r!r} 的容量必须是正整数，得到 {cap!r}"})
+                continue
+            if cap <= 0:
+                errors.append({"code": "bad_resource_capacity", "field": field,
+                               "message": f"资源 {r!r} 的容量必须为正整数，得到 {cap}（容量 <= 0 无法占用）"})
+                continue
+            resource_capacities[r] = cap
+
     if dst_issues or errors:
         return None, dst_issues + errors
 
@@ -206,6 +236,7 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
         team_members=team_members,
         blackouts=blackouts,
         freezes=freezes,
+        resource_capacities=resource_capacities,
         max_solve_seconds=req.max_solve_seconds,
     ), []
 
