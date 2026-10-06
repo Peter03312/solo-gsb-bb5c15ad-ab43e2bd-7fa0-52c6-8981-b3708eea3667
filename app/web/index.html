@@ -58,6 +58,7 @@
     <h2>请求（JSON）</h2>
     <div class="btns">
       <button onclick="loadScenario('basic')">示例：跨时区可行排程</button>
+      <button class="secondary" onclick="loadScenario('capacity')">共享资源并行容量</button>
       <button class="secondary" onclick="loadScenario('dst')">DST 校验示例</button>
       <button class="secondary" onclick="loadScenario('infeasible')">不可行示例</button>
     </div>
@@ -109,6 +110,23 @@ const SCENARIOS = {
     freezes: [
       {label:"周末封网", start:"2026-11-14T02:00", end:"2026-11-14T03:00", timezone:"UTC"}
     ]
+  },
+  capacity: {
+    services: [
+      { id:"canary-a", name:"灰度服务 A", timezone:"UTC",
+        duration_minutes:30, rollback_minutes:30, resources:["canary-pool"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T03:00", timezone:"UTC"}]},
+      { id:"canary-b", name:"灰度服务 B", timezone:"UTC",
+        duration_minutes:30, rollback_minutes:30, resources:["canary-pool"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T03:00", timezone:"UTC"}]},
+      { id:"canary-c", name:"灰度服务 C", timezone:"UTC",
+        duration_minutes:30, rollback_minutes:30, resources:["canary-pool"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T03:00", timezone:"UTC"}]}
+    ],
+    // canary-pool 容量 2：A、B 可并行占用，C 错峰一小时；
+    // 改成 1 则三者串行，改成 0 会以 422（bad_resource_capacity）拒绝。
+    resource_capacities: { "canary-pool": 2 },
+    dependencies: [], service_teams: [], team_blackouts: [], freezes: []
   },
   dst: {
     services: [

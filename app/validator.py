@@ -56,6 +56,7 @@ class Normalized:
     team_members: dict[str, list[str]]  # service_id -> teams
     blackouts: dict[str, list[Period]]  # team -> periods
     freezes: list[Period]
+    resource_capacities: dict[str, int]  # 声明容量的资源 -> 正整数容量（未声明者按 1 处理）
     max_solve_seconds: float
 
 
@@ -125,6 +126,15 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
             continue
         seen.add(s.id)
 
+        # 同一服务重复列出同一资源没有“占多个名额”的语义，按输入错误拒绝。
+        seen_resources: set[str] = set()
+        for r in s.resources:
+            if r in seen_resources:
+                errors.append({"code": "duplicate_resource",
+                               "field": f"services[{s.id}].resources",
+                               "message": f"服务 {s.id} 重复列出资源: {r}（同一资源在一个服务中只能出现一次）"})
+            seen_resources.add(r)
+
         windows: list[Window] = []
         for j, w in enumerate(s.windows):
             field = f"services[{s.id}].windows[{j}]"
@@ -148,11 +158,22 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
             timezone=service_tz.get(s.id, "UTC"),
             duration=s.duration_minutes * 60,
             rollback=s.rollback_minutes * 60,
-            resources=list(s.resources),
+            resources=list(dict.fromkeys(s.resources)),
             windows=windows,
         )
 
-    # 3) 依赖引用与环。
+    # 3) 资源容量：必须为正整数（未声明的资源仍按容量 1 处理）。
+    resource_capacities: dict[str, int] = {}
+    for r, cap in req.resource_capacities.items():
+        if cap is None or cap <= 0:
+            errors.append({"code": "bad_resource_capacity",
+                           "field": f"resource_capacities[{r}]",
+                           "message": f"资源 {r} 的容量必须为正整数（实际: {cap}）；"
+                                      "未声明的资源按容量 1 处理"})
+            continue
+        resource_capacities[r] = cap
+
+    # 4) 依赖引用与环。
     deps: list[Dependency] = []
     for k, d in enumerate(req.dependencies):
         field = f"dependencies[{k}]"
@@ -172,7 +193,7 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
             errors.append({"code": "dependency_cycle", "field": "dependencies",
                            "message": "服务依赖存在环，无法定义先后顺序: " + " -> ".join(cycle)})
 
-    # 4) 团队归属与禁发。
+    # 5) 团队归属与禁发。
     team_members: dict[str, list[str]] = {}
     for m in req.service_teams:
         if m.service not in services:
@@ -190,7 +211,7 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
             )
     # 团队没有禁发记录是合法的（表示该团队全程可发布），不报错。
 
-    # 5) 全局维护冻结。
+    # 6) 全局维护冻结。
     freezes: list[Period] = []
     for f in req.freezes:
         parsed = parse_period(f.start, f.end, f.timezone, f"freezes[{f.label}]")
@@ -206,6 +227,7 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
         team_members=team_members,
         blackouts=blackouts,
         freezes=freezes,
+        resource_capacities=resource_capacities,
         max_solve_seconds=req.max_solve_seconds,
     ), []
 

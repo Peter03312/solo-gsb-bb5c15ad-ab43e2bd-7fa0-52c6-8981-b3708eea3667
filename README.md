@@ -11,7 +11,7 @@
 | 依赖先后 | `下游开始 ≥ 上游部署结束 + gap_minutes` |
 | 团队禁发 | 仅**部署区间**不得与所属团队禁发时段重叠（回滚允许进入禁发期） |
 | 维护冻结 | **占用区间（部署+回滚）**不得与任何冻结重叠 |
-| 共享资源 | 同名资源同一时间只能被一个服务占用（含回滚窗口） |
+| 共享资源 | 同名资源在任意时刻的**占用数（含回滚窗口）**不得超过其容量。容量由请求顶层的 `resource_capacities` 声明（正整数）；**未声明的资源容量为 1**，即同一时间只能被一个服务占用。容量为 2 时两个服务可并行，第三个必须错峰 |
 | 夏令时 | 不带偏移量的本地墙上时间若在 DST 切换时**重复**（回拨）或**不存在**（前拨），请求被拒绝（422），并给出 gap 两侧 / 重复两次的绝对时间供修正；带偏移量的绝对时间（如 `...+01:00`、`...Z`）无歧义，直接通过 |
 | 无解 | 求解器返回一个足以导致矛盾的约束子集（sufficient assumption core），即“阻塞组合”，放松其中任意一项后可重新求解；**不返回部分排程** |
 
@@ -80,9 +80,25 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
   "freezes": [
     {"label": "周末封网", "start": "2026-11-14T02:00", "end": "2026-11-14T03:00", "timezone": "UTC"}
   ],
+  "resource_capacities": {
+    "payment-db": 1,
+    "k8s-prod-east": 2
+  },
   "max_solve_seconds": 10
 }
 ```
+
+`resource_capacities` 为可选字段：
+
+- 键是资源名，值是该资源的**并行容量（正整数）**。服务 `resources` 中每列出一个资源，
+  就在自己的部署 + 回滚占用区间内占用该资源 **1 个名额**；任意时刻同资源占用数不得超过容量。
+  容量为 2 时两项发布可并行，第三项必须错峰。
+- **未在 `resource_capacities` 中出现的资源按容量 1 处理**；省略整个字段或传 `{}` 时，
+  行为与旧版本完全一致（所有共享资源串行）。
+- 容量必须为正整数（`0`、负数按 422 拒绝，错误码 `bad_resource_capacity`）；
+  同一服务在 `resources` 中重复列出同一资源也按 422 拒绝（`duplicate_resource`）。
+- 容量不满足时（如三个服务只能挤在容量 2 的同一时段）仍返回 **200、`feasible=false`**，
+  `blockers` 中给出含资源容量约束的阻塞组合，不返回部分排程。
 
 时间串支持两种写法：
 
@@ -127,7 +143,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 }
 ```
 
-**输入错误（422）**：DST 重复/不存在、未知时区、依赖环、区间非法、引用不存在的服务、候选窗短于部署+回滚占用等：
+**输入错误（422）**：DST 重复/不存在、未知时区、依赖环、区间非法、引用不存在的服务、候选窗短于部署+回滚占用、资源容量非正（`bad_resource_capacity`）、同一服务重复列出资源（`duplicate_resource`）等：
 
 ```json
 {
@@ -147,6 +163,48 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 `dst_ambiguous`（重复时间）的建议分别给出回拨前后的两个绝对时刻（第一次/第二次）。
 这些值可直接粘贴回输入框重新提交。
+
+#### 共享资源并行容量示例（HTTP）
+
+三个服务都要占用 `canary-pool`，声明容量 2：前两项并行，第三项自动错峰一小时。
+
+```bash
+curl -X POST http://localhost:8000/api/schedule \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "services": [
+      {"id":"canary-a","name":"灰度 A","timezone":"UTC",
+       "duration_minutes":30,"rollback_minutes":30,"resources":["canary-pool"],
+       "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T03:00:00Z","timezone":"UTC"}]},
+      {"id":"canary-b","name":"灰度 B","timezone":"UTC",
+       "duration_minutes":30,"rollback_minutes":30,"resources":["canary-pool"],
+       "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T03:00:00Z","timezone":"UTC"}]},
+      {"id":"canary-c","name":"灰度 C","timezone":"UTC",
+       "duration_minutes":30,"rollback_minutes":30,"resources":["canary-pool"],
+       "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T03:00:00Z","timezone":"UTC"}]}
+    ],
+    "resource_capacities": {"canary-pool": 2}
+  }'
+```
+
+返回（200，节选）：`canary-a` 与 `canary-b` 同在 `00:00` 开始、占用至 `01:00`，
+`canary-c` 错峰到 `01:00` 开始、占用至 `02:00` —— 任意时刻池内占用数均为 2，未超容量。
+把容量改为 1（或直接省略该字段）时三者串行到 `00:00 / 01:00 / 02:00` 开始；
+窗口只够容纳两个占用时则返回 `feasible=false`，`blockers` 含
+`{"code": "resource:canary-pool", ...}`。容量写成 `0` 或负数返回 422：
+
+```json
+{
+  "errors": [
+    {
+      "code": "bad_resource_capacity",
+      "field": "resource_capacities[canary-pool]",
+      "message": "资源 canary-pool 的容量必须为正整数（实际: 0）；未声明的资源按容量 1 处理",
+      "suggestions": null
+    }
+  ]
+}
+```
 
 ### `POST /api/schedule/diff` — 变更影响预演
 
@@ -168,6 +226,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
   给出变化前后的 UTC 时刻与变化分钟数（`delta_minutes` 正为推迟、负为提前；未变化的字段为 `null`）；
 - `added` / `removed`：仅在 `modified` 中出现（新增）/ 仅在 `current` 中出现（被移除）的服务；
 - 两份请求结果完全一致时，三个列表均为空（空差异）。
+- 两侧请求**各自携带自己的 `resource_capacities` 并独立求解**：例如 current 未声明容量
+  （资源串行）、modified 把同一资源声明为容量 2（两项并行），差异会体现在被提前的
+  服务上；某一侧容量非法（422）或容量导致无解时，同样只在 `failures` 的该侧给出
+  完整错误 / 阻塞组合（含资源约束），`diff` 为 `null`，不给部分排程。
 - **任一请求输入错误或无解时，不输出差异结果**：在 `failures` 中按 `current` / `modified`
   分别给出该侧的完整输入错误（HTTP 422）或阻塞约束组合（HTTP 200、`feasible=false`），
   与直接调用 `/api/schedule` 得到的内容一致。

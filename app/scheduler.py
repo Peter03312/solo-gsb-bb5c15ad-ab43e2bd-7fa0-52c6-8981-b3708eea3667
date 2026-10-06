@@ -7,7 +7,8 @@
   NoOverlap（占用区间 vs 缺口）。
 - 维护冻结：占用区间不得与任何冻结区间相交（部署与回滚窗口都要避开）。
 - 团队禁发：仅部署区间不得与所属团队禁发时段相交（回滚允许进入禁发期）。
-- 共享资源：同一资源上的所有服务占用区间两两不重叠。
+- 共享资源：同一资源任意时刻的占用数不得超过其容量（默认 1，即两两不重叠；
+  resource_capacities 可声明更大的正整数容量，允许至多容量个服务并行）。
 - 依赖：downstream.start >= upstream.start + deploy_up + gap。
 
 CP-SAT 的 NoOverlap 不接受约束级 enforcement literal，因此采用“可选镜像区间”：
@@ -85,6 +86,9 @@ def solve(norm: Normalized) -> SolveResult:
         deploy_iv[sid] = m.new_fixed_size_interval_var(start, s.duration, f"deploy_{sid}")
         occupy_iv[sid] = m.new_fixed_size_interval_var(
             start, s.duration + s.rollback, f"occupy_{sid}")
+        # 窗口之外的缺口仅在 h0~h1 内部建模，而最后的窗口终点即 h1；因此还须显式保证
+        # 占用区间（含回滚）不越过 h1，否则起点取在 h1 时整段占用会漏到所有窗口之外。
+        m.add(start + s.duration + s.rollback <= h1)
 
     def new_assumption(code: str, message: str) -> cp_model.IntVar:
         b = m.new_bool_var(f"assm_{code.replace(':', '_')}")
@@ -146,22 +150,36 @@ def solve(norm: Normalized) -> SolveResult:
                     opt_constant(p.start, p.end - p.start, lit, f"bo_p_{sid}_{p.start}"),
                 ])
 
-    # ---- 共享资源占用：同资源的占用区间互不重叠（每个资源一条假设） ----
+    # ---- 共享资源占用：同资源的并行占用数不得超过容量（每个资源一条假设） ----
+    # 未声明容量的资源按容量 1 处理（两两不重叠）；容量 C≥2 时允许至多 C 个占用并行。
     resource_users: dict[str, list[str]] = {}
     for sid, s in services.items():
         for r in s.resources:
             resource_users.setdefault(r, []).append(sid)
     for resource, users in resource_users.items():
-        if len(users) < 2:
+        cap = norm.resource_capacities.get(resource, 1)
+        if len(users) <= cap:
+            # 用户数本就不超过容量：任何时刻都不可能超载，无需建立约束。
             continue
-        lit = new_assumption(
-            f"resource:{resource}",
-            f"共享资源 {resource} 同时只能被一个服务占用（部署+回滚窗口）；"
-            f"涉及: {', '.join(services[u].name for u in users)}",
-        )
-        m.add_no_overlap([
-            opt_mirror(occupy_iv[u], lit, f"res_{resource}_{u}") for u in users
-        ])
+        if cap == 1:
+            message = (
+                f"共享资源 {resource} 同时只能被一个服务占用（部署+回滚窗口）；"
+                f"涉及: {', '.join(services[u].name for u in users)}"
+            )
+        else:
+            message = (
+                f"共享资源 {resource} 的并行容量为 {cap}（部署+回滚窗口内任意时刻至多 {cap} 个服务占用），"
+                f"但共有 {len(users)} 个服务需要占用: {', '.join(services[u].name for u in users)}；"
+                f"超出容量的服务必须错峰"
+            )
+        lit = new_assumption(f"resource:{resource}", message)
+        mirrors = [opt_mirror(occupy_iv[u], lit, f"res_{resource}_{u}") for u in users]
+        if cap == 1:
+            m.add_no_overlap(mirrors)
+        else:
+            # 每个占用对资源的需求为 1；可选区间在 lit 为假时缺席、需求自动归零，
+            # 因此不可行核可以像 NoOverlap 一样直接定位到该资源假设。
+            m.add_cumulative(mirrors, [1] * len(mirrors), cap)
 
     # ---- 依赖先后 + 最小间隔（线性不等式支持直接挂 literal） ----
     for d in norm.dependencies:

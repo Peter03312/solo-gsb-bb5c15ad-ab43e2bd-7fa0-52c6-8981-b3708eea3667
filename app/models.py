@@ -52,6 +52,10 @@ class ScheduleRequest(BaseModel):
     service_teams: list[ServiceTeamIn] = Field(default_factory=list)
     team_blackouts: list[BlackoutIn] = Field(default_factory=list)
     freezes: list[FreezeIn] = Field(default_factory=list)
+    resource_capacities: dict[str, int] = Field(
+        default_factory=dict,
+        description="共享资源并行容量；未声明的资源容量为 1。同一时刻占用数不得超过容量",
+    )
     max_solve_seconds: float = Field(10.0, gt=0, le=60)
 
 
